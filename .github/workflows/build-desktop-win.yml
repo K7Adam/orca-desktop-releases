@@ -1,0 +1,193 @@
+name: Build Orca Desktop (Windows)
+
+# Builds the private fork (K7Adam/orca) whenever its branch moves and publishes a signed NSIS
+# installer here. Installed fork builds read this repo as their update feed (the fork stamps it into
+# resources/app-update.yml), so "Update" in Orca keeps a fork install on fork builds.
+# The source is read through a read-only deploy key; this repo only ever holds binaries.
+on:
+  schedule:
+    - cron: '7,37 * * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Build even if the source branch has not moved since the last release
+        type: boolean
+        default: false
+
+concurrency:
+  group: build-desktop-win
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+env:
+  SOURCE_REPO: K7Adam/orca
+  SOURCE_BRANCH: K7Adam/orca-wear
+  FEED_REPO: K7Adam/orca-desktop-releases
+  # Signing certificate subject; installed builds verify every update against it.
+  FORK_PUBLISHER: K7Adam Orca Fork
+  # Same rule as the phone and watch builds: minutes since 2026-01-01 at the commit's time.
+  VERSION_CODE_EPOCH_SECONDS: '1767225600'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      sha: ${{ steps.head.outputs.sha }}
+      build: ${{ steps.head.outputs.build }}
+      version: ${{ steps.head.outputs.version }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Compare the source branch with the last release
+        id: head
+        env:
+          DEPLOY_KEY: ${{ secrets.ORCA_SOURCE_DEPLOY_KEY }}
+          FORCE: ${{ inputs.force || false }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "$DEPLOY_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan github.com >> ~/.ssh/known_hosts 2>/dev/null
+          sha=$(git ls-remote "git@github.com:${SOURCE_REPO}.git" "refs/heads/${SOURCE_BRANCH}" | cut -f1)
+          [ -n "$sha" ] || { echo "Source branch not found" >&2; exit 1; }
+          last=$(jq -r '.commit // ""' desktop/latest.json 2>/dev/null || true)
+          build=false
+          if [ "$sha" != "$last" ] || [ "$FORCE" = "true" ]; then build=true; fi
+          # The commit time needs the commit itself; a blobless single-commit fetch is enough.
+          git init -q src && git -C src fetch -q --depth 1 --filter=blob:none "git@github.com:${SOURCE_REPO}.git" "$sha"
+          committed=$(git -C src log -1 --format=%ct FETCH_HEAD)
+          code=$(( (committed - VERSION_CODE_EPOCH_SECONDS) / 60 ))
+          # Next patch after upstream's newest release: the fork carries upstream main, which is
+          # past that release, and the build code orders fork builds within it.
+          tag=$(gh api repos/stablyai/orca/releases/latest --jq .tag_name)
+          base=${tag#v}
+          version="${base%.*}.$(( ${base##*.} + 1 ))-fork.${code}"
+          echo "source ${sha:0:12}, last release ${last:0:12}, build=$build, version=$version"
+          { echo "sha=$sha"; echo "build=$build"; echo "version=$version"; } >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: check
+    if: needs.check.outputs.build == 'true'
+    # Same image as upstream's release and dev-channel Windows legs (node-gyp and VS detection).
+    runs-on: windows-2022
+    timeout-minutes: 120
+    env:
+      NODE_OPTIONS: --max-old-space-size=4096
+      VERSION: ${{ needs.check.outputs.version }}
+      SHA: ${{ needs.check.outputs.sha }}
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v6
+        with:
+          repository: ${{ env.SOURCE_REPO }}
+          ref: ${{ needs.check.outputs.sha }}
+          ssh-key: ${{ secrets.ORCA_SOURCE_DEPLOY_KEY }}
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Checkout releases
+        uses: actions/checkout@v6
+        with:
+          path: releases
+
+      - name: Setup pnpm
+        uses: pnpm/setup@v2
+        with:
+          install: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version-file: package.json
+          cache: pnpm
+          cache-dependency-path: |
+            pnpm-lock.yaml
+            mobile/pnpm-lock.yaml
+
+      - name: Cache electron-builder downloads
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~\AppData\Local\electron\Cache
+            ~\AppData\Local\electron-builder\Cache
+          key: electron-builder-win-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: |
+            electron-builder-win-
+
+      # Retried: electron's postinstall pulls its binary from a CDN that returns transient 504s.
+      - name: Install dependencies
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 10
+          max_attempts: 3
+          retry_wait_seconds: 30
+          command: pnpm install --frozen-lockfile
+
+      - uses: ./.github/actions/install-mobile-dependencies
+
+      - name: Build app
+        shell: bash
+        run: pnpm build:release
+
+      - name: Signing certificate
+        shell: bash
+        env:
+          PFX_BASE64: ${{ secrets.ORCA_FORK_SIGNING_PFX_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$PFX_BASE64" | base64 -d > "$RUNNER_TEMP/orca-fork-codesign.pfx"
+          echo "WIN_CSC_LINK=$RUNNER_TEMP\\orca-fork-codesign.pfx" >> "$GITHUB_ENV"
+
+      - name: Package, sign and publish
+        uses: nick-fields/retry@v4
+        with:
+          timeout_minutes: 30
+          max_attempts: 2
+          retry_wait_seconds: 30
+          command: node config/scripts/ensure-native-runtime.mjs --runtime=electron; if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }; pnpm exec electron-builder --config config/electron-builder.config.cjs --win --publish always
+        env:
+          GH_TOKEN: ${{ github.token }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.ORCA_FORK_SIGNING_PASSWORD }}
+          ORCA_FORK_DESKTOP_REPO: ${{ env.FEED_REPO }}
+          ORCA_FORK_PUBLISHER: ${{ env.FORK_PUBLISHER }}
+          ORCA_LOCAL_BUILD_VERSION: ${{ needs.check.outputs.version }}
+          ORCA_BUILD_COMMIT: ${{ needs.check.outputs.sha }}
+
+      - name: Remove the signing certificate
+        if: always()
+        shell: bash
+        run: rm -f "$RUNNER_TEMP/orca-fork-codesign.pfx"
+
+      # The updater fetches latest.yml from the newest release; a release without it, or with an
+      # installer signed by anyone else, is one that installed builds must never be offered.
+      - name: Verify the published release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $assets = gh release view "v$env:VERSION" --repo $env:FEED_REPO --json assets --jq '.assets[].name'
+          if (-not ($assets -contains 'latest.yml')) { throw "latest.yml missing from v$env:VERSION" }
+          $exe = Get-ChildItem dist -Filter '*.exe' | Where-Object { $_.Name -notmatch 'uninstall' } | Select-Object -First 1
+          if (-not $exe) { throw 'no installer in dist/' }
+          $sig = Get-AuthenticodeSignature -LiteralPath $exe.FullName
+          if ($sig.SignerCertificate.Subject -ne "CN=$env:FORK_PUBLISHER") { throw "installer signed by '$($sig.SignerCertificate.Subject)'" }
+          "Published $($exe.Name), signed by $($sig.SignerCertificate.Subject)"
+
+      - name: Record the release
+        shell: bash
+        working-directory: releases
+        run: |
+          set -euo pipefail
+          mkdir -p desktop
+          jq -n --arg version "$VERSION" --arg commit "$SHA" --arg at "$(date -u +%FT%TZ)" \
+            '{version: $version, commit: $commit, builtAt: $at}' > desktop/latest.json
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add desktop/latest.json
+          git commit -q -m "desktop $VERSION"
+          git push -q
