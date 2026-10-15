@@ -65,7 +65,15 @@ jobs:
           # past that release, and the build code orders fork builds within it.
           tag=$(gh api repos/stablyai/orca/releases/latest --jq .tag_name)
           base=${tag#v}
-          version="${base%.*}.$(( ${base##*.} + 1 ))-fork.${code}"
+          base="${base%.*}.$(( ${base##*.} + 1 ))"
+          # Never below the newest fork release: upstream's "latest" can move back (a pulled
+          # release), and a lower base would read as a downgrade to every installed fork build.
+          fork_tag=$(gh release view --repo "$FEED_REPO" --json tagName --jq .tagName 2>/dev/null || true)
+          fork_base=${fork_tag#v}; fork_base=${fork_base%%-*}
+          if [ -n "$fork_base" ] && [ "$(printf '%s\n%s\n' "$base" "$fork_base" | sort -V | tail -1)" = "$fork_base" ]; then
+            base=$fork_base
+          fi
+          version="${base}-fork.${code}"
           echo "source ${sha:0:12}, last release ${last:0:12}, build=$build, version=$version"
           { echo "sha=$sha"; echo "build=$build"; echo "version=$version"; } >> "$GITHUB_OUTPUT"
 
